@@ -992,23 +992,21 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
 
         reset_signals = self.register_signals()
         try:
-            callback_sink: DatabaseCallbackSink
+            callback_sink: DatabaseCallbackSink # 데이터베이스 콜백 싱크 클래스의 인스턴스. 이 인스턴스는 Executor 실행 중 발생하는 이벤트를 데이터베이스에 저장하는 역할을 한다.
 
             from airflow.callbacks.database_callback_sink import DatabaseCallbackSink
 
             self.log.debug("Using DatabaseCallbackSink as callback sink.")
             callback_sink = DatabaseCallbackSink()
 
-            for executor in self.job.executors:
+            for executor in self.job.executors: # multi Executor 인스턴스 (Airflow 3.0+)
                 executor.job_id = self.job.id
                 executor.callback_sink = callback_sink
-                executor.start()
+                executor.start() # 각 실행자 인스턴스의 start 메서드를 호출하여 Executor를 시작한다.
 
-            # local import due to type_checking.
             from airflow.executors.base_executor import BaseExecutor
 
-            # Pass a reference to the dictionary.
-            # Any changes made by a dag_run instance, will be reflected to the dictionary of this class.
+            # thread-safe 딕셔너리를 활용하여 실행 중인 DagRun 및 TaskInstance의 상태 정보를 관리한다.
             DagRun.set_active_spans(active_spans=self.active_spans)
             BaseExecutor.set_active_spans(active_spans=self.active_spans)
 
@@ -1219,52 +1217,52 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         is_unit_test: bool = conf.getboolean("core", "unit_test_mode")
 
         timers = EventScheduler()
-
-        # Check on start up, then every configured interval
+ 
         self.adopt_or_reset_orphaned_tasks()
 
         timers.call_regular_interval(
             conf.getfloat("scheduler", "orphaned_tasks_check_interval", fallback=300.0),
-            self.adopt_or_reset_orphaned_tasks,
+            self.adopt_or_reset_orphaned_tasks, # 오류 발생 시 자동으로 복구하는 작업
         )
 
         timers.call_regular_interval(
             conf.getfloat("scheduler", "trigger_timeout_check_interval", fallback=15.0),
-            self.check_trigger_timeouts,
+            self.check_trigger_timeouts, # 트리거 타임아웃 체크
         )
 
         timers.call_regular_interval(
             30,
-            self._mark_backfills_complete,
+            self._mark_backfills_complete, # 백필이란 모든 작업이 완료되었는지 확인하는 작업
         )
 
         timers.call_regular_interval(
             conf.getfloat("scheduler", "pool_metrics_interval", fallback=5.0),
-            self._emit_pool_metrics,
+            self._emit_pool_metrics, # pool과 slot은 task 병렬 수행 시 자원 할당 단위로 사용되어 뻑나는 걸 방지
         )
 
         timers.call_regular_interval(
             conf.getfloat("scheduler", "running_metrics_interval", fallback=30.0),
-            self._emit_running_ti_metrics,
+            self._emit_running_ti_metrics, # 실행 중인 task 인스턴스의 상태 정보를 추적하는 작업
         )
 
         timers.call_regular_interval(
             conf.getfloat("scheduler", "task_instance_heartbeat_timeout_detection_interval", fallback=10.0),
-            self._find_and_purge_task_instances_without_heartbeats,
+            self._find_and_purge_task_instances_without_heartbeats, # heartbeat 타임아웃 체크
         )
 
-        timers.call_regular_interval(60.0, self._update_dag_run_state_for_paused_dags)
+        timers.call_regular_interval(60.0, self._update_dag_run_state_for_paused_dags) # 일시 중단된 DAG의 상태 업데이트
 
         timers.call_regular_interval(
             conf.getfloat("scheduler", "task_queued_timeout_check_interval"),
-            self._handle_tasks_stuck_in_queued,
+            self._handle_tasks_stuck_in_queued, # queued 상태에서 멈춰있는 task 처리
         )
 
         timers.call_regular_interval(
             conf.getfloat("scheduler", "parsing_cleanup_interval"),
-            self._update_asset_orphanage,
+            self._update_asset_orphanage, # asset이란 airflow에서 2.7+ 버전부터 지원하는 '관리 데이터셋'(input/output)
         )
 
+        # local executor 인스턴스가 있는 경우에 동작하는 로직 - 일반적으로 celery나 k8s에서는 사용되지 않음(remote executor라서)
         if any(x.is_local for x in self.job.executors):
             bundle_cleanup_mgr = BundleUsageTrackingManager()
             check_interval = conf.getint(
@@ -1277,6 +1275,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     action=bundle_cleanup_mgr.remove_stale_bundle_versions,
                 )
 
+        # 무한 루프 시작
         for loop_count in itertools.count(start=1):
             with (
                 Trace.start_span(span_name="scheduler_job_loop", component="SchedulerJobRunner") as span,
@@ -1292,18 +1291,15 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 with create_session() as session:
                     self._end_spans_of_externally_ended_ops(session)
 
-                    # This will schedule for as many executors as possible.
                     num_queued_tis = self._do_scheduling(session)
-                    # Don't keep any objects alive -- we've possibly just looked at 500+ ORM objects!
                     session.expunge_all()
 
-                # Heartbeat all executors, even if they're not receiving new tasks this loop. It will be
-                # either a no-op, or they will check-in on currently running tasks and send out new
-                # events to be processed below.
                 for executor in self.job.executors:
                     executor.heartbeat()
 
                 with create_session() as session:
+                    # executor에서 완료된 이벤트를 처리하기 위한 DB세션 컨텍스트 매니저
+                    # - 모든 executor에서 완료된 작업(성공/실패)의 상태를 데이터베이스에 반영
                     num_finished_events = 0
                     for executor in self.job.executors:
                         num_finished_events += self._process_executor_events(
@@ -1313,6 +1309,8 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 for executor in self.job.executors:
                     try:
                         with create_session() as session:
+                            # executor의 작업 이벤트 로그를 저장하기 위한 DB세션 컨텍스트 매니저
+                            # - 작업 실행 중 생성된 이벤트 로그를 데이터베이스에 기록
                             self._process_task_event_logs(executor._task_event_logs, session)
                     except Exception:
                         self.log.exception("Something went wrong when trying to save task event logs.")
@@ -1336,12 +1334,9 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 )
 
             if not is_unit_test and not num_queued_tis and not num_finished_events:
-                # If the scheduler is doing things, don't sleep. This means when there is work to do, the
-                # scheduler will run "as quick as possible", but when it's stopped, it can sleep, dropping CPU
-                # usage when "idle"
                 time.sleep(min(self._scheduler_idle_sleep_time, next_event or 0))
 
-            if loop_count >= self.num_runs > 0:
+            if loop_count >= self.num_runs > 0: # num_runs가 설정되어 있다면(test 환경) 그에 맞춰 종료 (무한루프는 -1로 설정)
                 self.log.info(
                     "Exiting scheduler loop as requested number of runs (%d - got to %d) has been reached",
                     self.num_runs,
@@ -1384,26 +1379,21 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         # Put a check in place to make sure we don't commit unexpectedly
         with prohibit_commit(session) as guard:
             if settings.USE_JOB_SCHEDULE:
-                self._create_dagruns_for_dags(guard, session)
+                self._create_dagruns_for_dags(guard, session) # 새로운 DagRun 생성
 
-            self._start_queued_dagruns(session)
+            self._start_queued_dagruns(session) # QUEUED 상태의 DagRun 시작
             guard.commit()
 
-            # Bulk fetch the currently active dag runs for the dags we are
-            # examining, rather than making one query per DagRun
-            dag_runs = DagRun.get_running_dag_runs_to_examine(session=session)
+            dag_runs = DagRun.get_running_dag_runs_to_examine(session=session) # 현재 실행 중인 DagRun 조회
 
-            callback_tuples = self._schedule_all_dag_runs(guard, dag_runs, session)
+            callback_tuples = self._schedule_all_dag_runs(guard, dag_runs, session) # DagRun에 대하여 TaskInstance 스케줄링(None, Scheduled, queued, running)
 
-        # Send the callbacks after we commit to ensure the context is up to date when it gets run
-        # cache saves time during scheduling of many dag_runs for same dag
         cached_get_dag: Callable[[DagRun], DAG | None] = lru_cache()(
             partial(self.scheduler_dag_bag.get_dag, session=session)
         )
         for dag_run, callback_to_run in callback_tuples:
             dag = cached_get_dag(dag_run)
             if dag:
-                # Sending callbacks to the database, so it must be done outside of prohibit_commit.
                 self._send_dag_callbacks_to_processor(dag, callback_to_run)
             else:
                 self.log.error("DAG '%s' not found in serialized_dag table", dag_run.dag_id)
@@ -1447,15 +1437,15 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
     @retry_db_transaction
     def _create_dagruns_for_dags(self, guard: CommitProhibitorGuard, session: Session) -> None:
         """Find Dag Models needing DagRuns and Create Dag Runs with retries in case of OperationalError."""
-        query, triggered_date_by_dag = DagModel.dags_needing_dagruns(session)
-        all_dags_needing_dag_runs = set(query.all())
+        query, triggered_date_by_dag = DagModel.dags_needing_dagruns(session) # 새로운 DagRun이 필요한 DAG 조회(타고 들어가면 설명O)
+        all_dags_needing_dag_runs = set(query.all()) # 
         asset_triggered_dags = [
             dag for dag in all_dags_needing_dag_runs if dag.dag_id in triggered_date_by_dag
         ]
         non_asset_dags = all_dags_needing_dag_runs.difference(asset_triggered_dags)
-        self._create_dag_runs(non_asset_dags, session)
+        self._create_dag_runs(non_asset_dags, session) # 시간 조건 충족 DagRun 생성
         if asset_triggered_dags:
-            self._create_dag_runs_asset_triggered(
+            self._create_dag_runs_asset_triggered( # 자산 트리거된 DagRun 생성
                 dag_models=asset_triggered_dags,
                 triggered_date_by_dag=triggered_date_by_dag,
                 session=session,

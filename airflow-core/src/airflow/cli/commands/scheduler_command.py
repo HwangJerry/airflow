@@ -43,7 +43,7 @@ def _run_scheduler_job(args) -> None:
         run_job(job=job_runner.job, execute_callable=job_runner._execute)
 
 
-@cli_utils.action_cli
+@cli_utils.action_cli # argparse 라이브러리에서 제공하는 데코레이터. 이를 이용하여 airflow scheduler 명령어를 실행할 때 필요한 로직을 선언 가능.
 @providers_configuration_loaded
 def scheduler(args: Namespace):
     """Start Airflow Scheduler."""

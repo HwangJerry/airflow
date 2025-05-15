@@ -2119,92 +2119,102 @@ class DagModel(Base):
             if dm.relative_fileloc not in rel_filelocs:
                 dm.is_stale = True
 
-    @classmethod
-    def dags_needing_dagruns(cls, session: Session) -> tuple[Query, dict[str, datetime]]:
-        """
-        Return (and lock) a list of Dag objects that are due to create a new DagRun.
+@classmethod
+# DagRun을 생성해야 하는 Dag 객체 목록을 반환하고 락을 설정
+def dags_needing_dagruns(cls, session: Session) -> tuple[Query, dict[str, datetime]]:
+    
+    """
+    Return (and lock) a list of Dag objects that are due to create a new DagRun.
 
-        This will return a resultset of rows that is row-level-locked with a "SELECT ... FOR UPDATE" query,
-        you should ensure that any scheduling decisions are made in a single transaction -- as soon as the
-        transaction is committed it will be unlocked.
-        """
-        from airflow.models.serialized_dag import SerializedDagModel
+    This will return a resultset of rows that is row-level-locked with a "SELECT ... FOR UPDATE" query,
+    you should ensure that any scheduling decisions are made in a single transaction -- as soon as the
+    transaction is committed it will be unlocked.
+    """
+    from airflow.models.serialized_dag import SerializedDagModel
 
-        evaluator = AssetEvaluator(session)
+    evaluator = AssetEvaluator(session)
 
-        def dag_ready(dag_id: str, cond: BaseAsset, statuses: dict[AssetUniqueKey, bool]) -> bool | None:
-            # if dag was serialized before 2.9 and we *just* upgraded,
-            # we may be dealing with old version.  In that case,
-            # just wait for the dag to be reserialized.
-            try:
-                return evaluator.run(cond, statuses)
-            except AttributeError:
-                log.warning("dag '%s' has old serialization; skipping DAG run creation.", dag_id)
-                return None
+    def dag_ready(dag_id: str, cond: BaseAsset, statuses: dict[AssetUniqueKey, bool]) -> bool | None:
+        # 매개변수: dag_id(DAG 식별자), cond(자산 조건), statuses(자산 상태 딕셔너리)
+        
+        try:
+            return evaluator.run(cond, statuses)
+            # 자산 조건 평가기를 실행하여 DAG 실행 조건이 충족되었는지 확인
+        except AttributeError:
+            log.warning("dag '%s' has old serialization; skipping DAG run creation.", dag_id)
+            return None
 
-        # this loads all the ADRQ records.... may need to limit num dags
-        adrq_by_dag: dict[str, list[AssetDagRunQueue]] = defaultdict(list)
-        for r in session.scalars(select(AssetDagRunQueue)):
-            adrq_by_dag[r.target_dag_id].append(r)
+    adrq_by_dag: dict[str, list[AssetDagRunQueue]] = defaultdict(list)
+    
+    for r in session.scalars(select(AssetDagRunQueue)):
+        adrq_by_dag[r.target_dag_id].append(r)
 
-        dag_statuses: dict[str, dict[AssetUniqueKey, bool]] = {
-            dag_id: {AssetUniqueKey.from_asset(adrq.asset): True for adrq in adrqs}
-            for dag_id, adrqs in adrq_by_dag.items()
-        }
-        ser_dags = SerializedDagModel.get_latest_serialized_dags(dag_ids=list(dag_statuses), session=session)
-        for ser_dag in ser_dags:
-            dag_id = ser_dag.dag_id
-            statuses = dag_statuses[dag_id]
-            if not dag_ready(dag_id, cond=ser_dag.dag.timetable.asset_condition, statuses=statuses):
-                del adrq_by_dag[dag_id]
-                del dag_statuses[dag_id]
-        del dag_statuses
+    dag_statuses: dict[str, dict[AssetUniqueKey, bool]] = {
+        dag_id: {AssetUniqueKey.from_asset(adrq.asset): True for adrq in adrqs}
+        for dag_id, adrqs in adrq_by_dag.items()
+    }
+    
+    ser_dags = SerializedDagModel.get_latest_serialized_dags(dag_ids=list(dag_statuses), session=session)
+    
+    for ser_dag in ser_dags:
+        dag_id = ser_dag.dag_id
+        statuses = dag_statuses[dag_id]
+        
+        if not dag_ready(dag_id, cond=ser_dag.dag.timetable.asset_condition, statuses=statuses):
+            del adrq_by_dag[dag_id]
+            del dag_statuses[dag_id]
+    
+    del dag_statuses
 
-        # triggered dates for asset triggered dags
-        triggered_date_by_dag: dict[str, datetime] = {
-            dag_id: max(adrq.created_at for adrq in adrqs) for dag_id, adrqs in adrq_by_dag.items()
-        }
-        del adrq_by_dag
+    triggered_date_by_dag: dict[str, datetime] = {
+        dag_id: max(adrq.created_at for adrq in adrqs) for dag_id, adrqs in adrq_by_dag.items()
+    }
+    
+    del adrq_by_dag
 
-        asset_triggered_dag_ids = set(triggered_date_by_dag.keys())
-        if asset_triggered_dag_ids:
-            # exclude as max active runs has been reached
-            exclusion_list = set(
-                session.scalars(
-                    select(DagModel.dag_id)
-                    .join(DagRun.dag_model)
-                    .where(DagRun.state.in_((DagRunState.QUEUED, DagRunState.RUNNING)))
-                    .where(DagModel.dag_id.in_(asset_triggered_dag_ids))
-                    .group_by(DagModel.dag_id)
-                    .having(func.count() >= func.max(DagModel.max_active_runs))
-                )
+    asset_triggered_dag_ids = set(triggered_date_by_dag.keys())
+    
+    if asset_triggered_dag_ids:
+        
+        # exclude as max active runs has been reached
+        exclusion_list = set(
+            session.scalars(
+                select(DagModel.dag_id)
+                .join(DagRun.dag_model)
+                .where(DagRun.state.in_((DagRunState.QUEUED, DagRunState.RUNNING)))
+                .where(DagModel.dag_id.in_(asset_triggered_dag_ids))
+                .group_by(DagModel.dag_id)
+                .having(func.count() >= func.max(DagModel.max_active_runs))
             )
-            if exclusion_list:
-                asset_triggered_dag_ids -= exclusion_list
-                triggered_date_by_dag = {
-                    k: v for k, v in triggered_date_by_dag.items() if k not in exclusion_list
-                }
-
-        # We limit so that _one_ scheduler doesn't try to do all the creation of dag runs
-        query = (
-            select(cls)
-            .where(
-                cls.is_paused == expression.false(),
-                cls.is_stale == expression.false(),
-                cls.has_import_errors == expression.false(),
-                or_(
-                    cls.next_dagrun_create_after <= func.now(),
-                    cls.dag_id.in_(asset_triggered_dag_ids),
-                ),
-            )
-            .order_by(cls.next_dagrun_create_after)
-            .limit(cls.NUM_DAGS_PER_DAGRUN_QUERY)
         )
+        
+        if exclusion_list:
+            asset_triggered_dag_ids -= exclusion_list
+            triggered_date_by_dag = {
+                k: v for k, v in triggered_date_by_dag.items() if k not in exclusion_list
+            }
 
-        return (
-            session.scalars(with_row_locks(query, of=cls, session=session, skip_locked=True)),
-            triggered_date_by_dag,
+    # 시간 조건 충족 또는 자산 트리거된 DAG 조건 충족
+    query = (
+        select(cls)
+        .where(
+            cls.is_paused == expression.false(), # 일시중지되지 않은 DAG
+            cls.is_stale == expression.false(), # 오래된 DAG가 아님
+            cls.has_import_errors == expression.false(), # import error(보통 DAG 잘못쓰면 이거 뜸)가 없음
+            or_(
+                cls.next_dagrun_create_after <= func.now(), # 시간 조건 충족
+                cls.dag_id.in_(asset_triggered_dag_ids), # 자산 트리거된 DAG 조건 충족
+            ),
         )
+        .order_by(cls.next_dagrun_create_after)
+        .limit(cls.NUM_DAGS_PER_DAGRUN_QUERY)
+    )
+
+    return (
+        session.scalars(with_row_locks(query, of=cls, session=session, skip_locked=True)),
+        triggered_date_by_dag,
+    )
+    # skip_locked=True: 이미 다른 트랜잭션에 의해 락이 걸린 행은 건너뜀
 
     def calculate_dagrun_date_fields(
         self,
